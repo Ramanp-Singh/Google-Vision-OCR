@@ -37,7 +37,7 @@ This ensures:
 
 
 # Features
-## OCR processing
+### OCR processing
 
 - Batch OCR of multiple images in one API request
 - Verbatim text extraction (no paraphrasing or correction)
@@ -51,14 +51,14 @@ This ensures:
 
 
 
-## Geometry preservation
+### Geometry preservation
 - Stores block-level bounding boxes
 - Detects:
   - Tables
   - Diagrams (picture blocks)
 - Does not infer table cells or diagram relationships
 
-## Retrieval-optimised indexing
+### Retrieval-optimised indexing
 - Global page numbering across all images
 - Chunked text (headings, lists, paragraphs)
 - Deterministic chunk IDs
@@ -67,7 +67,7 @@ This ensures:
   - Terms (tokenised keywords)
   - Title-case phrases
 
-## Traceability
+### Traceability
 - Raw and indexed files are linked via:
   - Raw filename
   - SHA256 hash
@@ -81,7 +81,7 @@ python code_file_name.py --topic-id "topic_name" --image-folder "directory_path_
 
 
 
-## Input batching
+### Input batching
 
 - The script was tested with batches of ~20 images per run.
 - This helps:
@@ -90,7 +90,7 @@ python code_file_name.py --topic-id "topic_name" --image-folder "directory_path_
   - Simplify output review
 
 
-## Dynamic input and output paths
+### Dynamic input and output paths
 - Input and output paths are not hard-coded.
 - Paths must be supplied each time the script runs.
 - This allows:
@@ -98,18 +98,18 @@ python code_file_name.py --topic-id "topic_name" --image-folder "directory_path_
   - Different output folders per run
   - Easy automation in pipelines
 
-## Google credentials
+### Google credentials
 - A valid Google service account JSON key is required.
 - Must be configured before running the script.
 
-## Performance considerations
+### Performance considerations
 - Processing time depends on:
 - Number of images
 - Image resolution
 - Network latency
 - API quotas
 
-## API costs
+### API costs
 - Google Vision API is a paid service.
 - Charges apply per image processed.
 - Check Google Cloud pricing before large runs.
