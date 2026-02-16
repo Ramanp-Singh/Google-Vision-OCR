@@ -114,3 +114,12 @@ python code_file_name.py --topic-id "topic_name" --image-folder "directory_path_
 - Charges apply per image processed.
 - Check Google Cloud pricing before large runs.
 
+<br>
+
+# Responsible Use
+
+This software is provided for legitimate OCR, indexing, and research purposes only.
+
+The author does not endorse or support any illegal, unethical, or abusive use of this tool.
+Users are solely responsible for ensuring their use of this software complies with all applicable laws and regulations.
+
