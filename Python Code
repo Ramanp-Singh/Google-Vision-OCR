@@ -1,0 +1,763 @@
+
+#!/usr/bin/env python3
+"""
+vision_multi_image_folder_topic_to_indexed_json_two_file_v2.py
+
+Purpose
+- Stage 1: OCR multiple images in ONE Google Vision API batch request (single topic)
+  - Input is a folder path (images are auto-discovered)
+  - Output is strict RAW JSON (no paraphrasing, no assumptions, no corrections)
+  - Explicit reporting for: unreadable images, API errors, empty OCR, empty pages, unsupported files
+  - Preserves ONLY block-level geometry so tables and diagrams can be contextually indexed/searchable
+    without inferring rows/columns/cells or diagram semantics.
+- Stage 2: Build a retrieval-optimized INDEXED JSON (small) that is easy to search and load alongside many files
+  - Adds per-page chunks (verbatim only) and a retrieval_index for topic/keyword/phrase lookup
+  - Does NOT embed the raw OCR payload inside the indexed file
+  - Stores doc.raw_ref with raw_file_name + raw_sha256 so raw can be opened on demand
+
+Fixes
+1) Global page counter when flattening images:
+   - page_id and page_number are unique across ALL images (p0001..p00NN)
+   - provenance retains source_image_index and source_page_number_in_image
+2) Improved heading detection so topic indexing is populated:
+   - Detects ALL-CAPS headings and Title Case headings (e.g., 'Purpose of Reports')
+   - Rejects common OCR junk headings (e.g., 'N/A', 'N / A') so they do not become topics
+   - No paraphrasing; tagging only
+
+Notes
+- This script does NOT infer table structure (rows/columns/cells) or diagram structure (arrows/flow).
+- If Vision does not emit TABLE/PICTURE blocks for your inputs, detected_tables/diagrams may remain empty.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as _dt
+import hashlib
+import io
+import json
+import os
+import re
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+from google.cloud import vision
+
+
+# =========================
+# CONFIGURATION (EDIT THESE)
+# =========================
+
+# 1) Service account key file used by Google Vision API
+SERVICE_ACCOUNT_KEY = "[File.json]"
+
+# 2) If confidence is below this, text is flagged but NOT removed or modified
+LOW_CONFIDENCE_THRESHOLD = 0.80
+
+# 3) Supported image extensions (folder auto-discovery)
+SUPPORTED_EXT = (".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp")
+
+# =========================
+# COMMON HELPERS
+# =========================
+
+SCHEMA_VERSION = "1.0.0"
+
+
+def _utc_now_iso() -> str:
+    return _dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+
+
+def _sha256_bytes(b: bytes) -> str:
+    h = hashlib.sha256()
+    h.update(b)
+    return h.hexdigest()
+
+
+def _sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _natural_key(s: str) -> List[Any]:
+    """
+    Natural sorting key:
+    Example: ["page2.png", "page10.png"] sorts as page2, page10.
+    """
+    return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", s)]
+
+
+def load_images_from_folder(folder_path: str) -> Tuple[List[str], List[str]]:
+    """
+    Returns:
+      - image_files: list of full file paths (supported images only), sorted in natural order
+      - unsupported_files: list of filenames ignored due to unsupported extension
+    """
+    if not os.path.isdir(folder_path):
+        raise ValueError(f"Image folder does not exist: {folder_path}")
+
+    image_files: List[str] = []
+    unsupported_files: List[str] = []
+
+    for name in os.listdir(folder_path):
+        full_path = os.path.join(folder_path, name)
+
+        if not os.path.isfile(full_path):
+            continue
+
+        if name.lower().endswith(SUPPORTED_EXT):
+            image_files.append(full_path)
+        else:
+            unsupported_files.append(name)
+
+    image_files.sort(key=lambda p: _natural_key(os.path.basename(p)))
+    unsupported_files.sort(key=_natural_key)
+
+    return image_files, unsupported_files
+
+
+def _bbox_to_dict(bbox) -> Dict[str, Any]:
+    """
+    Converts Vision bounding box to a JSON-serializable structure.
+    Uses vertices as provided (no normalization, no inference).
+    """
+    if not bbox or not getattr(bbox, "vertices", None):
+        return {"vertices": []}
+
+    verts = []
+    for v in bbox.vertices:
+        verts.append({
+            "x": int(v.x) if v.x is not None else None,
+            "y": int(v.y) if v.y is not None else None
+        })
+    return {"vertices": verts}
+
+
+def _safe_enum_name(enum_val) -> str:
+    """
+    Returns a stable string for protobuf enum values where possible.
+    """
+    try:
+        return enum_val.name
+    except Exception:
+        return str(enum_val)
+
+
+# =========================
+# STAGE 1: OCR (VISION API) -> RAW JSON
+# =========================
+
+def ocr_multiple_images_single_topic(
+    topic_id: str,
+    image_paths: List[str],
+    output_json_path: str,
+    unsupported_files: Optional[List[str]] = None
+) -> Dict[str, Any]:
+    """
+    OCR multiple images in ONE Vision API request.
+    All images belong to ONE topic.
+    Produces strict RAW JSON with explicit error reporting.
+
+    Keeps:
+    - lines[] and unreliable_segments[] (verbatim text + confidence)
+    - detected_tables[] / detected_diagrams[] (by block_type)
+    - blocks[] with ONLY block-level geometry (bounding_box) + block_type + confidence
+    """
+    if unsupported_files is None:
+        unsupported_files = []
+
+    client = vision.ImageAnnotatorClient.from_service_account_file(SERVICE_ACCOUNT_KEY)
+
+    topic_output: Dict[str, Any] = {
+        "topic_id": topic_id,
+        "source_type": "images",
+        "images": [],
+        "errors": [],
+        "warnings": []
+    }
+
+    if unsupported_files:
+        topic_output["warnings"].append({
+            "type": "unsupported_files_ignored",
+            "files": unsupported_files
+        })
+
+    if not image_paths:
+        topic_output["errors"].append({
+            "type": "no_supported_images",
+            "details": "No supported image files were provided to the OCR function."
+        })
+        Path(output_json_path).write_text(json.dumps(topic_output, ensure_ascii=False, indent=2), encoding="utf-8")
+        return topic_output
+
+    requests: List[vision.AnnotateImageRequest] = []
+    request_to_image_index: List[int] = []
+
+    for idx, image_path in enumerate(image_paths, start=1):
+        image_result: Dict[str, Any] = {
+            "image_index": idx,
+            "image_file": image_path,
+            "pages": [],
+            "uninterpretable": []
+        }
+
+        try:
+            with io.open(image_path, "rb") as f:
+                content = f.read()
+
+            image = vision.Image(content=content)
+            req = vision.AnnotateImageRequest(
+                image=image,
+                features=[vision.Feature(type_=vision.Feature.Type.DOCUMENT_TEXT_DETECTION)]
+            )
+            requests.append(req)
+            request_to_image_index.append(idx)
+
+        except Exception as e:
+            image_result["uninterpretable"].append({
+                "type": "file_read_error",
+                "details": str(e)
+            })
+
+        topic_output["images"].append(image_result)
+
+    if not requests:
+        topic_output["errors"].append({
+            "type": "no_readable_images",
+            "details": "None of the image files could be read from disk. No Vision API request was made."
+        })
+        Path(output_json_path).write_text(json.dumps(topic_output, ensure_ascii=False, indent=2), encoding="utf-8")
+        return topic_output
+
+    response = client.batch_annotate_images(requests=requests)
+
+    for res_idx, res in enumerate(response.responses):
+        image_index = request_to_image_index[res_idx]
+        image_slot = topic_output["images"][image_index - 1]
+
+        if res.error and res.error.message:
+            image_slot["uninterpretable"].append({
+                "type": "api_error",
+                "details": res.error.message
+            })
+            continue
+
+        if not res.full_text_annotation or not res.full_text_annotation.text:
+            image_slot["uninterpretable"].append({
+                "type": "no_text_detected",
+                "details": "Vision API returned no text for this image."
+            })
+            continue
+
+        for page_index, page in enumerate(res.full_text_annotation.pages, start=1):
+            page_obj: Dict[str, Any] = {
+                "page_number": page_index,
+                "lines": [],
+                "unreliable_segments": [],
+                "blocks": [],
+                "detected_tables": [],
+                "detected_diagrams": []
+            }
+
+            # Paragraph-level flattening (verbatim)
+            for block in page.blocks:
+                for paragraph in block.paragraphs:
+                    words: List[str] = []
+                    for word in paragraph.words:
+                        word_text = "".join(symbol.text for symbol in word.symbols)
+                        words.append(word_text)
+
+                    paragraph_text = " ".join(words)
+                    confidence = float(paragraph.confidence) if paragraph.confidence is not None else None
+
+                    page_obj["lines"].append({
+                        "text": paragraph_text,
+                        "confidence": confidence
+                    })
+
+                    if confidence is not None and confidence < LOW_CONFIDENCE_THRESHOLD:
+                        page_obj["unreliable_segments"].append({
+                            "text": paragraph_text,
+                            "confidence": confidence,
+                            "reason": "low_confidence_paragraph"
+                        })
+
+            # Block-level geometry only
+            for block_index, block in enumerate(page.blocks, start=1):
+                block_type_str = "UNKNOWN"
+                if hasattr(block, "block_type"):
+                    block_type_str = _safe_enum_name(block.block_type)
+
+                if block_type_str == "TABLE":
+                    page_obj["detected_tables"].append({
+                        "block_index": block_index,
+                        "block_type": block_type_str
+                    })
+                if block_type_str == "PICTURE":
+                    page_obj["detected_diagrams"].append({
+                        "block_index": block_index,
+                        "block_type": block_type_str
+                    })
+
+                page_obj["blocks"].append({
+                    "block_index": block_index,
+                    "block_type": block_type_str,
+                    "bounding_box": _bbox_to_dict(getattr(block, "bounding_box", None)),
+                    "confidence": float(block.confidence) if getattr(block, "confidence", None) is not None else None
+                })
+
+            if not page_obj["lines"]:
+                image_slot["uninterpretable"].append({
+                    "type": "empty_page",
+                    "page_number": page_index,
+                    "details": "No text detected on this page."
+                })
+
+            image_slot["pages"].append(page_obj)
+
+    Path(output_json_path).write_text(json.dumps(topic_output, ensure_ascii=False, indent=2), encoding="utf-8")
+    return topic_output
+
+
+# =========================
+# STAGE 2: INDEXING (POST-PROCESS) -> SMALL INDEXED JSON
+# =========================
+
+def _norm_ws_for_type_detection(s: str) -> str:
+    return re.sub(r"\s+", " ", s).strip()
+
+
+# Reject common non-headings that otherwise look like headings in OCR
+_HEADING_BLACKLIST = {
+    "n/a", "na", "n / a", "not applicable",
+    ".", "-", "–", "_"
+}
+
+
+def _is_title_case_heading(t: str) -> bool:
+    """
+    Heuristic: detects short Title Case headings like 'Purpose of Reports'
+    without altering the stored text. This is tagging only.
+    """
+    if not t:
+        return False
+
+    norm = _norm_ws_for_type_detection(t)
+    low = norm.lower()
+
+    if low in _HEADING_BLACKLIST:
+        return False
+
+    # Too long tends to be paragraph text
+    if len(norm) > 90:
+        return False
+
+    # Avoid sentences
+    if norm.endswith((".", "?", "!")):
+        return False
+
+    letters = [c for c in norm if c.isalpha()]
+    if len(letters) < 4:
+        return False
+
+    words = [w for w in norm.split(" ") if w]
+    if len(words) == 0 or len(words) > 10:
+        return False
+
+    def is_title_word(w: str) -> bool:
+        if not w:
+            return False
+        w2 = w.strip("()[]{}:,;")
+        if not w2:
+            return False
+        if w2.isupper() and len(w2) >= 2:
+            return True
+        return w2[0].isupper()
+
+    titleish = sum(1 for w in words if is_title_word(w))
+    ratio = titleish / max(1, len(words))
+
+    return ratio >= 0.7
+
+
+def _classify_line(line_text: str) -> str:
+    t = _norm_ws_for_type_detection(line_text)
+    if not t:
+        return "unknown"
+
+    # Bullet detection (verbatim storage unchanged)
+    if t.startswith(("•", "⚫", "●", "-", "–", "*")):
+        return "bullet_list"
+
+    # Numbered list detection
+    if re.match(r"^\d+[\.\)]\s+", t):
+        return "numbered_list"
+
+    # Improved heading detection:
+    # 1) ALL CAPS / mostly uppercase short lines
+    if len(t) <= 80:
+        letters = [c for c in t if c.isalpha()]
+        if letters:
+            upper_ratio = sum(1 for c in letters if c.isupper()) / max(1, len(letters))
+            if upper_ratio >= 0.65 and t.lower() not in _HEADING_BLACKLIST:
+                return "heading"
+
+    # 2) Title Case headings like 'Purpose of Reports'
+    if _is_title_case_heading(t):
+        return "heading"
+
+    return "paragraph"
+
+
+def _merge_line_group_type(current_type: str, new_type: str) -> str:
+    priority = {
+        "heading": 5,
+        "section_heading": 4,
+        "bullet_list": 3,
+        "numbered_list": 3,
+        "paragraph": 2,
+        "unknown": 1,
+    }
+    return current_type if priority.get(current_type, 0) >= priority.get(new_type, 0) else new_type
+
+
+def _build_chunks_from_lines(lines: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    chunks: List[Dict[str, Any]] = []
+    buffer_texts: List[str] = []
+    buffer_line_indexes: List[int] = []
+    buffer_conf: List[float] = []
+    buffer_type: str = "unknown"
+
+    def flush():
+        nonlocal buffer_texts, buffer_line_indexes, buffer_conf, buffer_type
+        if not buffer_texts:
+            return
+        conf_val = None
+        if buffer_conf:
+            conf_val = sum(buffer_conf) / len(buffer_conf)
+        chunks.append({
+            "chunk_type": buffer_type if buffer_type else "unknown",
+            "text": "\n".join(buffer_texts),  # verbatim join
+            "confidence": conf_val,
+            "provenance": {"from_lines": buffer_line_indexes.copy()}
+        })
+        buffer_texts = []
+        buffer_line_indexes = []
+        buffer_conf = []
+        buffer_type = "unknown"
+
+    for i, line in enumerate(lines, start=1):
+        text = line.get("text", "")
+        if not isinstance(text, str):
+            text = str(text)
+
+        conf = line.get("confidence", None)
+        conf = float(conf) if isinstance(conf, (int, float)) else None
+
+        sep = _norm_ws_for_type_detection(text)
+        if sep in ("", "."):
+            flush()
+            continue
+
+        ltype = _classify_line(text)
+
+        if ltype == "heading":
+            flush()
+            chunks.append({
+                "chunk_type": "heading",
+                "text": text,
+                "confidence": conf,
+                "provenance": {"from_lines": [i]}
+            })
+            continue
+
+        if buffer_texts:
+            if (buffer_type in ("bullet_list", "numbered_list")) != (ltype in ("bullet_list", "numbered_list")):
+                flush()
+            elif buffer_type in ("bullet_list", "numbered_list") and ltype != buffer_type:
+                flush()
+
+        if not buffer_texts:
+            buffer_type = ltype
+        else:
+            buffer_type = _merge_line_group_type(buffer_type, ltype)
+
+        buffer_texts.append(text)
+        buffer_line_indexes.append(i)
+        if conf is not None:
+            buffer_conf.append(conf)
+
+    flush()
+    return chunks
+
+
+def _tokenize_for_index(text: str) -> List[str]:
+    if not isinstance(text, str) or not text:
+        return []
+    return re.findall(r"[A-Za-z0-9_\/]+", text)
+
+
+def _extract_terms(text: str) -> List[str]:
+    terms = []
+    for tok in _tokenize_for_index(text):
+        t = tok.lower()
+        if t.isdigit():
+            if len(t) >= 2:
+                terms.append(t)
+        else:
+            if len(t) >= 3:
+                terms.append(t)
+    return terms
+
+
+def _extract_titlecase_phrases(text: str) -> List[str]:
+    if not isinstance(text, str) or not text:
+        return []
+    pattern = re.compile(r"(?:\b(?:[A-Z][A-Za-z0-9_\/]*|[A-Z]{2,})\b(?:\s+|$)){2,6}")
+    phrases = []
+    for m in pattern.finditer(text):
+        p = m.group(0).strip()
+        if p and any(ch.isalnum() for ch in p):
+            phrases.append(p)
+    return phrases
+
+
+def index_stage1_json(
+    stage1: Dict[str, Any],
+    collection_id: str,
+    raw_output_path: Path,
+    image_folder: str
+) -> Dict[str, Any]:
+    """
+    Build the SMALL indexed JSON.
+    Does NOT embed the raw OCR pages.
+    Stores a raw_ref pointer to raw file name + SHA256.
+    Applies GLOBAL page numbering across all images.
+    """
+    errors: List[Dict[str, Any]] = []
+
+    # doc_id derived deterministically from stage1 JSON bytes (content-based)
+    stage1_bytes = json.dumps(stage1, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    doc_id = _sha256_bytes(stage1_bytes)
+
+    topic_id = stage1.get("topic_id") if isinstance(stage1, dict) else ""
+    source_type = stage1.get("source_type") if isinstance(stage1, dict) else ""
+
+    # Compute raw file SHA256 from the actual written raw output file (source of truth)
+    raw_sha256 = ""
+    try:
+        if raw_output_path.exists():
+            raw_sha256 = _sha256_file(raw_output_path)
+    except Exception as e:
+        errors.append({
+            "error_id": f"err_{doc_id[:12]}_raw_sha",
+            "severity": "warning",
+            "type": "raw_ref",
+            "message": f"Unable to compute raw file sha256: {type(e).__name__}: {e}"
+        })
+        raw_sha256 = ""
+
+    # Build pages/chunks
+    index_pages: List[Dict[str, Any]] = []
+
+    images = stage1.get("images", []) if isinstance(stage1, dict) else []
+    if not images:
+        errors.append({
+            "error_id": f"err_{doc_id[:12]}_no_images",
+            "severity": "warning",
+            "type": "partial_ocr",
+            "message": "No images[] array found or images[] was empty."
+        })
+
+    # IMPORTANT: global_page_number increments across ALL images in the batch
+    global_page_counter = 0
+
+    for img_idx, img in enumerate(images, start=1):
+        pages = img.get("pages", []) if isinstance(img, dict) else []
+        if not pages:
+            errors.append({
+                "error_id": f"err_{doc_id[:12]}_img{img_idx}_no_pages",
+                "severity": "warning",
+                "type": "empty_page",
+                "message": f"images[{img_idx}] pages[] missing or empty."
+            })
+            continue
+
+        for p in pages:
+            global_page_counter += 1
+            global_page_number = global_page_counter
+
+            # Source page number inside the image (Vision often starts at 1 for each image)
+            source_page_number_in_image = 1
+            if isinstance(p, dict):
+                sp = p.get("page_number", 1)
+                source_page_number_in_image = int(sp) if isinstance(sp, int) else 1
+
+            lines = p.get("lines", []) if isinstance(p, dict) else []
+
+            chunks: List[Dict[str, Any]] = []
+            if isinstance(lines, list) and lines:
+                chunks = _build_chunks_from_lines(lines)
+            else:
+                errors.append({
+                    "error_id": f"err_{doc_id[:12]}_p{global_page_number}_empty_ocr",
+                    "severity": "warning",
+                    "type": "empty_page",
+                    "message": f"Page {global_page_number}: lines[] missing or empty."
+                })
+
+            # stable IDs + page provenance
+            for c_idx, c in enumerate(chunks, start=1):
+                c["chunk_id"] = f"doc_{doc_id}_p{int(global_page_number):04d}_c{c_idx:04d}"
+                c["reading_order"] = c_idx
+                c.setdefault("provenance", {})
+                # Provenance for traceability, without changing text
+                c["provenance"]["source_page_number"] = int(global_page_number)
+                c["provenance"]["source_image_index"] = int(img_idx)
+                c["provenance"]["source_page_number_in_image"] = int(source_page_number_in_image)
+
+            detected_tables = p.get("detected_tables", []) if isinstance(p, dict) else []
+            detected_diagrams = p.get("detected_diagrams", []) if isinstance(p, dict) else []
+
+            index_pages.append({
+                "page_id": f"doc_{doc_id}_p{int(global_page_number):04d}",
+                "page_number": int(global_page_number),
+                "page_label": str(global_page_number),
+                "chunks": chunks,
+                "signals": {
+                    "detected_tables": detected_tables if isinstance(detected_tables, list) else [],
+                    "detected_diagrams": detected_diagrams if isinstance(detected_diagrams, list) else []
+                }
+            })
+
+    if global_page_counter == 0:
+        errors.append({
+            "error_id": f"err_{doc_id[:12]}_no_pages_total",
+            "severity": "error",
+            "type": "empty_page",
+            "message": "No pages were produced from Stage 1 output. Check images[].pages[] content."
+        })
+
+    # Build retrieval_index for topic/keyword/phrase lookup.
+    retrieval_index: Dict[str, Any] = {"topics": {}, "terms": {}, "phrases": {}}
+
+    for pg in index_pages:
+        current_topic: Optional[str] = None
+        for ch in pg.get("chunks", []) or []:
+            ctext = ch.get("text", "")
+            ctype = ch.get("chunk_type", "unknown")
+            cid = ch.get("chunk_id", "")
+            pnum = pg.get("page_number", None)
+
+            # Topic detection: headings become topics (verbatim) but ignore blacklisted headings
+            if ctype in ("heading", "section_heading") and isinstance(ctext, str) and ctext.strip():
+                if _norm_ws_for_type_detection(ctext).lower() not in _HEADING_BLACKLIST:
+                    current_topic = ctext
+                    retrieval_index["topics"].setdefault(current_topic, {"chunks": [], "pages": []})
+
+            if current_topic and cid:
+                t = retrieval_index["topics"].setdefault(current_topic, {"chunks": [], "pages": []})
+                t["chunks"].append(cid)
+                if isinstance(pnum, int):
+                    t["pages"].append(pnum)
+
+            if cid and isinstance(ctext, str) and ctext:
+                for term in _extract_terms(ctext):
+                    retrieval_index["terms"].setdefault(term, []).append(cid)
+                for phr in _extract_titlecase_phrases(ctext):
+                    retrieval_index["phrases"].setdefault(phr, []).append(cid)
+
+    # De-duplicate topic pages (preserve first-seen order)
+    for _, payload in retrieval_index.get("topics", {}).items():
+        pages_list = payload.get("pages", [])
+        seen = set()
+        dedup_pages = []
+        for pn in pages_list:
+            if pn not in seen:
+                seen.add(pn)
+                dedup_pages.append(pn)
+        payload["pages"] = dedup_pages
+
+    # De-duplicate chunk lists for terms/phrases (preserve first-seen order)
+    for k in ("terms", "phrases"):
+        for key, ids in list(retrieval_index.get(k, {}).items()):
+            seen = set()
+            dedup = []
+            for cid in ids:
+                if cid not in seen:
+                    seen.add(cid)
+                    dedup.append(cid)
+            retrieval_index[k][key] = dedup
+
+    # Minimal stage1 summary (kept small); full details remain in raw file.
+    stage1_errors = stage1.get("errors", []) if isinstance(stage1, dict) else []
+    stage1_warnings = stage1.get("warnings", []) if isinstance(stage1, dict) else []
+    stage1_error_count = len(stage1_errors) if isinstance(stage1_errors, list) else 0
+    stage1_warning_count = len(stage1_warnings) if isinstance(stage1_warnings, list) else 0
+
+    out: Dict[str, Any] = {
+        "schema_version": SCHEMA_VERSION,
+        "collection_id": collection_id or "",
+        "doc": {
+            "doc_id": doc_id,
+            "topic_id": topic_id if isinstance(topic_id, str) else "",
+            "title": "",
+            "source": {
+                "source_type": "image" if source_type == "images" else (source_type or "unknown"),
+                "image_folder": image_folder,
+                "ingested_utc": _utc_now_iso()
+            },
+            "raw_ref": {
+                "raw_file_name": raw_output_path.name,
+                "raw_sha256": raw_sha256,
+                "raw_error_count": stage1_error_count,
+                "raw_warning_count": stage1_warning_count
+            }
+        },
+        "index": {"pages": index_pages},
+        "retrieval_index": retrieval_index,
+        "errors": errors
+    }
+    return out
+
+
+# =========================
+# MAIN (RUN BOTH STAGES)
+# =========================
+
+def main() -> None:
+    ap = argparse.ArgumentParser(
+        description="OCR a folder of images (Vision API) and produce a SMALL retrieval-optimized indexed JSON (verbatim) plus a RAW JSON."
+    )
+    ap.add_argument("--topic-id", required=True, help="Topic ID for this batch")
+    ap.add_argument("--image-folder", required=True, help="Folder containing images")
+    ap.add_argument("--output-raw-json", required=True, help="Stage 1 RAW output JSON path (OCR + block geometry)")
+    ap.add_argument("--output-indexed-json", required=True, help="Stage 2 INDEXED output JSON path (small, retrieval schema)")
+    ap.add_argument("--collection-id", default="", help="Optional collection identifier for grouping many docs")
+    args = ap.parse_args()
+
+    image_files, unsupported = load_images_from_folder(args.image_folder)
+
+    stage1 = ocr_multiple_images_single_topic(
+        topic_id=args.topic_id,
+        image_paths=image_files,
+        output_json_path=args.output_raw_json,
+        unsupported_files=unsupported
+    )
+
+    raw_out_path = Path(args.output_raw_json)
+    indexed = index_stage1_json(
+        stage1=stage1,
+        collection_id=args.collection_id,
+        raw_output_path=raw_out_path,
+        image_folder=args.image_folder
+    )
+
+    Path(args.output_indexed_json).write_text(json.dumps(indexed, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+if __name__ == "__main__":
+    main()
